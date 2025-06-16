@@ -9,11 +9,11 @@ app = Flask(__name__)
 FTP_HOST = '176.57.174.10'
 FTP_PORT = 50021
 FTP_USER = 'gpftp37275281717442833'
-FTP_PASS = 'LXNdGShY'  # <-- wpisz tutaj swoje prawdziwe hasło FTP
+FTP_PASS = 'TWOJE_PRAWDZIWE_HASLO'  # <-- wpisz tutaj swoje prawdziwe hasło FTP
 LOGS_PATH = '/SCUM/Saved/SaveFiles/Logs'
 
 def ftp_loop():
-    print("[BOT] ftp_loop startuje")  # drukuje info o starcie wątku
+    print("[BOT] ftp_loop startuje")
     processed_files = set()
     while True:
         try:
@@ -25,8 +25,9 @@ def ftp_loop():
 
             ftp.cwd(LOGS_PATH)
             files = ftp.nlst()
-            kill_logs = [f for f in files if f.startswith('kill_') and f.endswith('.log')]
+            print(f"[BOT] Wszystkie pliki w katalogu: {files}")  # <-- nowy print
 
+            kill_logs = [f for f in files if f.startswith('kill_') and f.endswith('.log')]
             new_logs = [f for f in kill_logs if f not in processed_files]
             print(f"[BOT] Nowe pliki do przetworzenia: {new_logs}")
 
