@@ -1,72 +1,67 @@
-import ftplib
-import time
 import os
+import time
+import ftplib
 import requests
+import threading
+from flask import Flask
 from dotenv import load_dotenv
-from io import BytesIO
 
+# Wczytaj zmienne środowiskowe
 load_dotenv()
 
 FTP_HOST = os.getenv("FTP_HOST")
 FTP_PORT = int(os.getenv("FTP_PORT", 21))
 FTP_USER = os.getenv("FTP_USER")
 FTP_PASS = os.getenv("FTP_PASS")
-FTP_PATH = os.getenv("FTP_PATH", "/SCUM/Saved/SaveFiles/Logs")
-WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 15))
+FTP_PATH = os.getenv("FTP_PATH")
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 
-processed_files = set()
+# Flask app do uruchomienia serwera HTTP
+app = Flask(__name__)
 
-def connect_ftp():
-    ftp = ftplib.FTP()
-    ftp.connect(FTP_HOST, FTP_PORT, timeout=10)
-    ftp.login(FTP_USER, FTP_PASS)
-    return ftp
+# Prosta strona główna, by Render wykrył port
+@app.route("/")
+def index():
+    return "SCUM bot działa 🎯"
 
-def get_kill_lines_from_log(log_text):
-    lines = log_text.splitlines()
-    kill_entries = []
-    for line in lines:
-        if "Died:" in line:
-            kill_entries.append(line.strip())
-    return kill_entries
+# Funkcja do wysyłania wiadomości na Discorda
+def send_discord_message(content):
+    data = {"content": content}
+    try:
+        response = requests.post(DISCORD_WEBHOOK, json=data)
+        print(f"[Discord] Status: {response.status_code}")
+    except Exception as e:
+        print(f"[Discord error] {e}")
 
-def send_to_discord(message):
-    if WEBHOOK_URL:
-        data = {"content": message}
-        requests.post(WEBHOOK_URL, json=data)
-
-def process_logs():
-    global processed_files
-    ftp = connect_ftp()
-    ftp.cwd(FTP_PATH)
-    files = ftp.nlst("kill_*.log")
-
-    for filename in files:
-        if filename in processed_files:
-            continue
-
-        memfile = BytesIO()
-        ftp.retrbinary(f"RETR {filename}", memfile.write)
-        memfile.seek(0)
-        text = memfile.read().decode("windows-1250", errors="ignore")
-
-        kill_lines = get_kill_lines_from_log(text)
-        for line in kill_lines:
-            send_to_discord(f"🔪 Zabójstwo: {line}")
-
-        processed_files.add(filename)
-
-    ftp.quit()
-
-def main():
-    print("SCUM bot uruchomiony...")
+# Główna logika bota – łączy się z FTP i szuka plików kill_*.log
+def bot_loop():
     while True:
         try:
-            process_logs()
-        except Exception as e:
-            print(f"[Błąd] {e}")
-        time.sleep(POLL_INTERVAL)
+            print("[BOT] Łączenie z FTP...")
+            with ftplib.FTP() as ftp:
+                ftp.connect(FTP_HOST, FTP_PORT, timeout=10)
+                ftp.login(FTP_USER, FTP_PASS)
+                ftp.cwd(FTP_PATH)
+                files = ftp.nlst()
 
+                kill_files = [f for f in files if f.startswith("kill_") and f.endswith(".log")]
+                print(f"[BOT] Znalezione pliki: {kill_files}")
+
+                # Na tym etapie możesz dodać dalszą analizę plików i wysyłkę do Discorda
+                # send_discord_message(f"Znalezione pliki: {kill_files}")
+
+        except Exception as e:
+            print(f"[BOT ERROR] {e}")
+        time.sleep(15)
+
+# Start bota w osobnym wątku
+def start_bot():
+    thread = threading.Thread(target=bot_loop)
+    thread.daemon = True
+    thread.start()
+
+# Uruchom Flask serwer i bota
 if __name__ == "__main__":
-    main()
+    start_bot()
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
