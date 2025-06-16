@@ -7,7 +7,6 @@ import threading
 from flask import Flask
 from dotenv import load_dotenv
 
-# Wczytaj zmienne środowiskowe
 load_dotenv()
 
 FTP_HOST = os.getenv("FTP_HOST")
@@ -17,17 +16,16 @@ FTP_PASS = os.getenv("FTP_PASS")
 FTP_PATH = os.getenv("FTP_PATH")
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 
-# Flask app do wykrywania portu przez Render
 app = Flask(__name__)
 
 @app.route("/")
 def index():
     return "SCUM bot działa 🎯"
 
-# Bufor wysłanych logów (nazwy plików)
+# Bufor przetworzonych plików
 sent_logs = set()
 
-# Wysyłanie wiadomości do Discorda
+# Funkcja do wysyłania wiadomości do Discorda
 def send_discord_message(content):
     try:
         response = requests.post(DISCORD_WEBHOOK, json={"content": content})
@@ -35,7 +33,7 @@ def send_discord_message(content):
     except Exception as e:
         print(f"[Discord ERROR] {e}")
 
-# Analiza zawartości loga
+# Analiza zawartości pliku kill log
 def parse_and_send_kill_log(filename, content):
     lines = content.splitlines()
     for i, line in enumerate(lines):
@@ -51,40 +49,44 @@ def parse_and_send_kill_log(filename, content):
             except json.JSONDecodeError:
                 print(f"[BŁĄD] Nieprawidłowy JSON w {filename}")
 
-# Główna pętla bota
+# Pobiera i przetwarza WSZYSTKIE kill logi na FTP
+def process_all_kill_logs():
+    print("[BOT] Pobieranie listy logów z FTP...")
+    try:
+        with ftplib.FTP() as ftp:
+            ftp.connect(FTP_HOST, FTP_PORT, timeout=10)
+            ftp.login(FTP_USER, FTP_PASS)
+            ftp.cwd(FTP_PATH)
+            files = ftp.nlst()
+
+            kill_logs = [f for f in files if f.startswith("kill_") and f.endswith(".log")]
+            for fname in kill_logs:
+                if fname in sent_logs:
+                    continue
+                try:
+                    with open(fname, "wb") as local_file:
+                        ftp.retrbinary(f"RETR {fname}", local_file.write)
+                    with open(fname, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read()
+                    parse_and_send_kill_log(fname, content)
+                    sent_logs.add(fname)
+                except Exception as e:
+                    print(f"[BŁĄD] Nie udało się przetworzyć {fname}: {e}")
+                finally:
+                    try:
+                        os.remove(fname)
+                    except:
+                        pass
+    except Exception as e:
+        print(f"[BOT ERROR] {e}")
+
+# Główna pętla co 15 sekund
 def bot_loop():
     while True:
-        try:
-            print("[BOT] Łączenie z FTP...")
-            with ftplib.FTP() as ftp:
-                ftp.connect(FTP_HOST, FTP_PORT, timeout=10)
-                ftp.login(FTP_USER, FTP_PASS)
-                ftp.cwd(FTP_PATH)
-                files = ftp.nlst()
-
-                kill_logs = [f for f in files if f.startswith("kill_") and f.endswith(".log")]
-                for fname in kill_logs:
-                    if fname in sent_logs:
-                        continue
-                    try:
-                        with open(fname, "wb") as local_file:
-                            ftp.retrbinary(f"RETR {fname}", local_file.write)
-                        with open(fname, "r", encoding="utf-8", errors="ignore") as f:
-                            content = f.read()
-                        parse_and_send_kill_log(fname, content)
-                        sent_logs.add(fname)
-                    except Exception as e:
-                        print(f"[BŁĄD] Nie udało się przetworzyć {fname}: {e}")
-                    finally:
-                        try:
-                            os.remove(fname)
-                        except:
-                            pass
-        except Exception as e:
-            print(f"[BOT ERROR] {e}")
+        process_all_kill_logs()
         time.sleep(15)
 
-# Startuje pętlę bota w tle
+# Uruchomienie pętli bota
 def start_bot():
     t = threading.Thread(target=bot_loop)
     t.daemon = True
