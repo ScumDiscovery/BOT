@@ -1,6 +1,7 @@
 import os
 import time
 import ftplib
+import json
 import requests
 import threading
 from flask import Flask
@@ -16,24 +17,41 @@ FTP_PASS = os.getenv("FTP_PASS")
 FTP_PATH = os.getenv("FTP_PATH")
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 
-# Flask app do uruchomienia serwera HTTP
+# Flask app do wykrywania portu przez Render
 app = Flask(__name__)
 
-# Prosta strona główna, by Render wykrył port
 @app.route("/")
 def index():
     return "SCUM bot działa 🎯"
 
-# Funkcja do wysyłania wiadomości na Discorda
-def send_discord_message(content):
-    data = {"content": content}
-    try:
-        response = requests.post(DISCORD_WEBHOOK, json=data)
-        print(f"[Discord] Status: {response.status_code}")
-    except Exception as e:
-        print(f"[Discord error] {e}")
+# Bufor wysłanych logów (nazwy plików)
+sent_logs = set()
 
-# Główna logika bota – łączy się z FTP i szuka plików kill_*.log
+# Wysyłanie wiadomości do Discorda
+def send_discord_message(content):
+    try:
+        response = requests.post(DISCORD_WEBHOOK, json={"content": content})
+        print(f"[Discord] Wysłano ({response.status_code})")
+    except Exception as e:
+        print(f"[Discord ERROR] {e}")
+
+# Analiza zawartości loga
+def parse_and_send_kill_log(filename, content):
+    lines = content.splitlines()
+    for i, line in enumerate(lines):
+        if "Died:" in line and i + 1 < len(lines):
+            try:
+                data = json.loads(lines[i + 1])
+                killer = data.get("killer", {}).get("playerName", "Nieznany")
+                victim = data.get("victim", {}).get("playerName", "Nieznany")
+                weapon = data.get("damageType", "brak informacji")
+                msg = f"☠️ **{victim}** został zabity przez **{killer}** (broń: `{weapon}`)"
+                send_discord_message(msg)
+                print(f"[LOG] Wysłano info z pliku {filename}")
+            except json.JSONDecodeError:
+                print(f"[BŁĄD] Nieprawidłowy JSON w {filename}")
+
+# Główna pętla bota
 def bot_loop():
     while True:
         try:
@@ -44,23 +62,34 @@ def bot_loop():
                 ftp.cwd(FTP_PATH)
                 files = ftp.nlst()
 
-                kill_files = [f for f in files if f.startswith("kill_") and f.endswith(".log")]
-                print(f"[BOT] Znalezione pliki: {kill_files}")
-
-                # Na tym etapie możesz dodać dalszą analizę plików i wysyłkę do Discorda
-                # send_discord_message(f"Znalezione pliki: {kill_files}")
-
+                kill_logs = [f for f in files if f.startswith("kill_") and f.endswith(".log")]
+                for fname in kill_logs:
+                    if fname in sent_logs:
+                        continue
+                    try:
+                        with open(fname, "wb") as local_file:
+                            ftp.retrbinary(f"RETR {fname}", local_file.write)
+                        with open(fname, "r", encoding="utf-8", errors="ignore") as f:
+                            content = f.read()
+                        parse_and_send_kill_log(fname, content)
+                        sent_logs.add(fname)
+                    except Exception as e:
+                        print(f"[BŁĄD] Nie udało się przetworzyć {fname}: {e}")
+                    finally:
+                        try:
+                            os.remove(fname)
+                        except:
+                            pass
         except Exception as e:
             print(f"[BOT ERROR] {e}")
         time.sleep(15)
 
-# Start bota w osobnym wątku
+# Startuje pętlę bota w tle
 def start_bot():
-    thread = threading.Thread(target=bot_loop)
-    thread.daemon = True
-    thread.start()
+    t = threading.Thread(target=bot_loop)
+    t.daemon = True
+    t.start()
 
-# Uruchom Flask serwer i bota
 if __name__ == "__main__":
     start_bot()
     port = int(os.environ.get("PORT", 8080))
