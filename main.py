@@ -2,16 +2,18 @@ from flask import Flask
 from threading import Thread
 import time
 import ftplib
+import json
 
 app = Flask(__name__)
 
 FTP_HOST = '176.57.174.10'
 FTP_PORT = 50021
 FTP_USER = 'gpftp37275281717442833'
-FTP_PASS = 'LXNdGShY'  # Wstaw swoje hasło
+FTP_PASS = 'TWOJE_HASLO_TUTAJ'  # <-- wpisz swoje hasło tutaj
 LOGS_PATH = '/SCUM/Saved/SaveFiles/Logs'
 
 def ftp_loop():
+    processed_files = set()
     while True:
         try:
             print("[BOT] Łączenie z FTP...")
@@ -20,14 +22,27 @@ def ftp_loop():
             ftp.login(FTP_USER, FTP_PASS)
             print("[BOT] Połączono z FTP")
 
-            print(f"[BOT] Przechodzę do katalogu {LOGS_PATH}")
             ftp.cwd(LOGS_PATH)
-
             files = ftp.nlst()
-            print(f"[BOT] Pliki na FTP: {files}")
-
             kill_logs = [f for f in files if f.startswith('kill_') and f.endswith('.log')]
-            print(f"[BOT] Znalezione pliki kill logów: {kill_logs}")
+
+            new_logs = [f for f in kill_logs if f not in processed_files]
+            print(f"[BOT] Nowe pliki do przetworzenia: {new_logs}")
+
+            for filename in new_logs:
+                print(f"[BOT] Pobieram i analizuję plik: {filename}")
+                lines = []
+                ftp.retrlines(f'RETR {filename}', lines.append)
+                for i, line in enumerate(lines):
+                    if line.startswith("Died:"):
+                        print(f"  --> {line.strip()}")
+                        if i + 1 < len(lines):
+                            try:
+                                data = json.loads(lines[i+1])
+                                print(f"      Parsed JSON: {data}")
+                            except json.JSONDecodeError as e:
+                                print(f"      Błąd parsowania JSON: {e}")
+                processed_files.add(filename)
 
             ftp.quit()
         except Exception as e:
@@ -43,5 +58,4 @@ if __name__ == '__main__':
     thread = Thread(target=ftp_loop, daemon=True)
     thread.start()
 
-    # Ważne: wyłączamy debug i reloader, żeby Flask nie uruchamiał się dwa razy
     app.run(host='0.0.0.0', port=10000, debug=False, use_reloader=False)
