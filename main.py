@@ -8,7 +8,7 @@ app = Flask(__name__)
 FTP_HOST = '176.57.174.10'
 FTP_PORT = 50021
 FTP_USER = 'gpftp37275281717442833'
-FTP_PASS = 'LXNdGShY'  # Wstaw swoje hasło
+FTP_PASS = 'TWOJE_HASLO_TUTAJ'  # Wstaw swoje hasło
 LOGS_PATH = '/SCUM/Saved/SaveFiles/Logs'
 
 def ftp_loop():
@@ -26,7 +26,6 @@ def ftp_loop():
             files = ftp.nlst()
             print(f"[BOT] Pliki na FTP: {files}")
 
-            # Tu możesz dodać logikę pobierania i analizy plików kill_*.log
             kill_logs = [f for f in files if f.startswith('kill_') and f.endswith('.log')]
             print(f"[BOT] Znalezione pliki kill logów: {kill_logs}")
 
@@ -41,9 +40,8 @@ def home():
     return "Bot SCUM działa!"
 
 if __name__ == '__main__':
-    # Uruchamiamy pętlę bota w osobnym wątku
     thread = Thread(target=ftp_loop, daemon=True)
     thread.start()
 
-    # Uruchamiamy serwer Flask
-    app.run(host='0.0.0.0', port=10000)
+    # Ważne: wyłączamy debug i reloader, żeby Flask nie uruchamiał się dwa razy
+    app.run(host='0.0.0.0', port=10000, debug=False, use_reloader=False)
