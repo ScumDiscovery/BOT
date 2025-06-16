@@ -8,7 +8,7 @@ app = Flask(__name__)
 FTP_HOST = '176.57.174.10'
 FTP_PORT = 50021
 FTP_USER = 'gpftp37275281717442833'
-FTP_PASS = 'TWOJE_HASLO_TUTAJ'  # Wstaw swoje hasło
+FTP_PASS = 'LXNdGShY'  # Wstaw swoje hasło
 LOGS_PATH = '/SCUM/Saved/SaveFiles/Logs'
 
 def ftp_loop():
