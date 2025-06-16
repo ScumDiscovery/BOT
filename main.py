@@ -1,109 +1,127 @@
-import os
 import time
 import json
+import os
 from ftplib import FTP
 import requests
-from flask import Flask
 
-app = Flask(__name__)
-
-# Konfiguracja (ustaw swoje dane)
-FTP_HOST = "176.57.174.10"
+# Ustawienia FTP
+FTP_HOST = '176.57.174.10'
 FTP_PORT = 50021
-FTP_USER = "gpftp37275281717442833"
-FTP_PASS = "LXNdGShY"
-LOGS_PATH = "/SCUM/Saved/SaveFiles/Logs"
-WEBHOOK_URL = "https://discord.com/api/webhooks/1383407890663997450/hr2zvr2PjO20IDLIk5nZd8juZDxG9kYkOOZ0c2_sqzGtuXra8Dz-HbhtnhtF3Yb0Hsgi"
+FTP_USER = 'gpftp37275281717442833'
+FTP_PASS = 'LXNdGShY'
 
-def send_discord_message(content):
-    data = {"content": content}
+# Katalog z logami na FTP
+LOG_DIR = '/SCUM/Saved/SaveFiles/Logs'
+
+# Webhook Discorda
+WEBHOOK_URL = 'https://discord.com/api/webhooks/xxx/yyy'
+
+# Plik do zapisywania postępu offsetu
+OFFSET_FILE = 'processed_offsets.json'
+
+
+def load_offsets():
+    if os.path.exists(OFFSET_FILE):
+        with open(OFFSET_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+
+def save_offsets(offsets):
+    with open(OFFSET_FILE, 'w') as f:
+        json.dump(offsets, f)
+
+
+def send_to_discord(message):
+    data = {"content": message}
     try:
-        resp = requests.post(WEBHOOK_URL, json=data)
-        if resp.status_code != 204:
-            print(f"[BOT][ERROR] Webhook zwrócił kod {resp.status_code}: {resp.text}")
+        response = requests.post(WEBHOOK_URL, json=data)
+        if response.status_code != 204 and response.status_code != 200:
+            print(f"[WARN] Discord webhook returned status {response.status_code}: {response.text}")
     except Exception as e:
-        print(f"[BOT][ERROR] Błąd podczas wysyłania webhooka: {e}")
+        print(f"[ERROR] Błąd wysyłania do Discorda: {e}")
 
-def parse_kill_log(lines):
-    """
-    Parsuje zawartość pliku kill_*.log.
-    Szuka linii zaczynających się od "Died:" i następnej linii JSON z danymi o zabójstwie.
-    Zwraca listę słowników z informacjami o zabójstwach.
-    """
-    kills = []
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        if line.startswith("Died:"):
-            # Następna linia to JSON
-            if i + 1 < len(lines):
-                try:
-                    kill_data = json.loads(lines[i + 1])
-                    kills.append(kill_data)
+
+def connect_ftp():
+    ftp = FTP()
+    ftp.connect(FTP_HOST, FTP_PORT, timeout=10)
+    ftp.login(FTP_USER, FTP_PASS)
+    ftp.cwd(LOG_DIR)
+    return ftp
+
+
+def read_new_logs(ftp, offsets):
+    files = ftp.nlst()
+    kill_files = [f for f in files if f.startswith('kill_') and f.endswith('.log')]
+    updated_offsets = offsets.copy()
+
+    for filename in kill_files:
+        try:
+            # Pobierz rozmiar pliku
+            size = ftp.size(filename)
+            last_line_idx = offsets.get(filename, 0)
+
+            # Pobierz cały plik (niestety FTP RETR nie obsługuje offsetu)
+            new_data = []
+            ftp.retrbinary(f"RETR {filename}", lambda d: new_data.append(d))
+            content = b''.join(new_data).decode('utf-8', errors='ignore')
+            lines = content.splitlines()
+
+            # Jeśli plik został skasowany/nadpisany i jest krótszy niż offset, zacznij od początku
+            if len(lines) < last_line_idx:
+                print(f"[INFO] Plik {filename} został skrócony lub nadpisany, reset offsetu")
+                last_line_idx = 0
+
+            if len(lines) == last_line_idx:
+                # Nic nowego w pliku
+                continue
+
+            # Przetwarzaj tylko nowe linie
+            i = last_line_idx
+            while i < len(lines):
+                line = lines[i]
+                if line.startswith("Died:"):
+                    # Następna linia powinna być JSON-em
+                    if i + 1 < len(lines):
+                        json_line = lines[i + 1]
+                        try:
+                            data = json.loads(json_line)
+                            killer = data.get("KillerName", "Unknown")
+                            victim = data.get("VictimName", "Unknown")
+                            weapon = data.get("WeaponName", "Unknown")
+                            msg = f"💀 {victim} zginął od {killer} za pomocą {weapon}."
+                            print(f"[INFO] Wykryto zabójstwo: {msg}")
+                            send_to_discord(msg)
+                        except json.JSONDecodeError:
+                            print(f"[WARN] Niepoprawny JSON w pliku {filename} linia {i + 1}")
                     i += 2
                     continue
-                except Exception as e:
-                    print(f"[BOT][WARN] Błąd parsowania JSON w pliku kill log: {e}")
-        i += 1
-    return kills
+                i += 1
 
-def format_kill_message(kill):
-    # Przykładowa formatka wiadomości o zabójstwie
-    killer = kill.get("killerName", "Unknown")
-    victim = kill.get("victimName", "Unknown")
-    weapon = kill.get("weaponName", "Unknown")
-    distance = kill.get("distance", "Unknown")
-    return f"💀 {killer} zabił {victim} używając {weapon} z odległości {distance}m."
+            updated_offsets[filename] = len(lines)
 
-def ftp_loop():
-    print("[BOT] ftp_loop startuje")
+        except Exception as e:
+            print(f"[ERROR] Błąd przetwarzania pliku {filename}: {e}")
+
+    return updated_offsets
+
+
+def main_loop():
+    offsets = load_offsets()
+    print("[BOT] Startuje pętla FTP...")
     while True:
         try:
             print("[BOT] Łączenie z FTP...")
-            ftp = FTP()
-            ftp.connect(FTP_HOST, FTP_PORT, timeout=15)
-            ftp.login(FTP_USER, FTP_PASS)
-            ftp.cwd(LOGS_PATH)
-            print(f"[BOT] Zawartość katalogu FTP {LOGS_PATH}: {ftp.nlst()}")
-
-            files = ftp.nlst()
-            kill_files = [f for f in files if f.startswith("kill_") and f.endswith(".log")]
-
-            if not kill_files:
-                print("[BOT] Brak plików kill_*.log do przetworzenia.")
-            else:
-                for filename in kill_files:
-                    print(f"[BOT] Pobieram plik: {filename}")
-                    lines = []
-                    ftp.retrlines(f"RETR {filename}", lines.append)
-                    
-                    kills = parse_kill_log(lines)
-                    if kills:
-                        for kill in kills:
-                            msg = format_kill_message(kill)
-                            print(f"[BOT] Wysyłam wiadomość: {msg}")
-                            send_discord_message(msg)
-                    else:
-                        print(f"[BOT] Nie znaleziono zabójstw w pliku {filename}")
-
-                    # Opcjonalnie: usuń plik po przetworzeniu, aby go nie czytać ponownie
-                    # ftp.delete(filename)
-                    # print(f"[BOT] Usunięto plik {filename} z FTP.")
-
+            ftp = connect_ftp()
+            new_offsets = read_new_logs(ftp, offsets)
             ftp.quit()
+            if new_offsets != offsets:
+                offsets = new_offsets
+                save_offsets(offsets)
         except Exception as e:
-            print(f"[BOT][BŁĄD] Problem z FTP lub przetwarzaniem: {e}")
-
-        print("[BOT] Czekam 15 sekund przed kolejnym sprawdzeniem...")
+            print(f"[ERROR] Błąd w pętli głównej: {e}")
         time.sleep(15)
 
-@app.route("/")
-def index():
-    return "SCUM Bot działa!"
 
-if __name__ == "__main__":
-    from threading import Thread
-    # Start FTP loop w osobnym wątku, żeby Flask działał równolegle
-    Thread(target=ftp_loop, daemon=True).start()
-    # Uruchom serwer Flask (np. na porcie 10000)
-    app.run(host="0.0.0.0", port=10000)
+if __name__ == '__main__':
+    main_loop()
