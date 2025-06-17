@@ -1,97 +1,81 @@
-import io
+import os
+import json
 import requests
 from PIL import Image, ImageDraw, ImageFont
-from flask import Flask, request
+from config import WEBHOOK_URL, MAP_PATH, BASE_TEMPLATE_PATH, WEAPON_ICONS_PATH
 
-# Flask app
-app = Flask(__name__)
+def parse_log(log_text):
+    lines = log_text.splitlines()
+    for line in lines:
+        if "Died:" in line and "KillerLoc" in line:
+            coords_start = line.find("KillerLoc :") + len("KillerLoc :")
+            coords_end = line.find("VictimLoc")
+            killer_coords = line[coords_start:coords_end].strip().strip(',').split(',')
+            killer_x = float(killer_coords[0])
+            killer_y = float(killer_coords[1])
+        if line.startswith("{\"Killer\""):
+            data = json.loads(line)
+            return {
+                "killer": data["Killer"]["ProfileName"],
+                "victim": data["Victim"]["ProfileName"],
+                "weapon": data["Weapon"].split(' ')[0],
+                "location": (killer_x, killer_y),
+                "time": data["TimeOfDay"]
+            }
+    return None
 
-# Webhook Discorda
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1383407890663997450/hr2zvr2PjO20IDLIk5nZd8juZDxG9kYkOOZ0c2_sqzGtuXra8Dz-HbhtnhtF3Yb0Hsgi"
+def crop_map(location, size=400):
+    x, y = location
+    full_map = Image.open(MAP_PATH)
+    map_width, map_height = full_map.size
+    game_map_width = 600000
+    game_map_height = 600000
+    px = int((x / game_map_width) * map_width)
+    py = int((abs(y) / game_map_height) * map_height)
+    left = max(px - size // 2, 0)
+    top = max(py - size // 2, 0)
+    right = min(px + size // 2, map_width)
+    bottom = min(py + size // 2, map_height)
+    return full_map.crop((left, top, right, bottom)).resize((size, size))
 
-# Stałe
-MAP_WIDTH = 4096
-MAP_HEIGHT = 4096
-GAME_WORLD_SIZE = 16  # 16x16 km mapa SCUM
+def generate_image(data):
+    base = Image.open(BASE_TEMPLATE_PATH).convert("RGBA")
+    draw = ImageDraw.Draw(base)
+    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    font = ImageFont.truetype(font_path, 24)
 
-def parse_log_entry(log_line):
-    """
-    Parsuje dane z loga SCUM:
-    - zabójca
-    - ofiara
-    - broń
-    - współrzędne X, Y
-    """
-    try:
-        parts = log_line.split("killed")
-        killer_info = parts[0].split("]")[-2].split("[")[0].strip()
-        victim_info = parts[1].split("with")[0].strip()
-        weapon = parts[1].split("with")[1].split("at")[0].strip()
-        coords_str = parts[1].split("at")[1].strip()
-        x = float(coords_str.split("X=")[1].split(",")[0])
-        y = float(coords_str.split("Y=")[1].split(",")[0])
-        return killer_info, victim_info, weapon, x, y
-    except Exception as e:
-        print(f"Błąd parsowania loga: {e}")
-        return None, None, None, None, None
+    cropped_map = crop_map(data["location"], size=300)
+    base.paste(cropped_map, (30, 30))
 
-def world_to_map(x, y):
-    scale = MAP_WIDTH / (GAME_WORLD_SIZE * 1000.0)
-    return int(x * scale), int((GAME_WORLD_SIZE * 1000.0 - y) * scale)
+    weapon_icon_path = os.path.join(WEAPON_ICONS_PATH, "katana.png")
+    if os.path.exists(weapon_icon_path):
+        weapon_icon = Image.open(weapon_icon_path).convert("RGBA").resize((64, 64))
+        base.paste(weapon_icon, (360, 30), weapon_icon)
 
-def generate_image(x, y, killer, victim, weapon):
-    base_map = Image.open("assets/scum_map.png").convert("RGBA")
-    draw = ImageDraw.Draw(base_map)
-    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"  # może wymagać zmiany lokalnie
-    try:
-        font = ImageFont.truetype(font_path, 40)
-    except:
-        font = ImageFont.load_default()
+    draw.text((30, 350), f"Killer: {data['killer']}", font=font, fill="white")
+    draw.text((30, 390), f"Victim: {data['victim']}", font=font, fill="white")
+    draw.text((30, 430), f"Weapon: {data['weapon']}", font=font, fill="white")
+    draw.text((30, 470), f"Time: {data['time']}", font=font, fill="white")
 
-    # Pozycja punktu
-    map_x, map_y = world_to_map(x, y)
-    radius = 12
-    draw.ellipse((map_x - radius, map_y - radius, map_x + radius, map_y + radius), fill=(255, 0, 0, 255), outline=(0, 0, 0))
+    out_path = "kill_report.png"
+    base.save(out_path)
+    return out_path
 
-    # Tekst
-    text = f"{killer} zabił {victim} przy użyciu {weapon}"
-    draw.text((50, 50), text, fill="white", font=font)
-
-    # Zapis do bufora
-    output = io.BytesIO()
-    base_map.save(output, format="PNG")
-    output.seek(0)
-    return output
-
-def send_to_discord(image_bytes, text):
-    files = {
-        "file": ("map.png", image_bytes, "image/png")
-    }
-    data = {
-        "content": text
-    }
-    response = requests.post(DISCORD_WEBHOOK_URL, data=data, files=files)
-    print("Status:", response.status_code)
-    return response.status_code == 204 or response.status_code == 200
-
-@app.route("/log", methods=["POST"])
-def handle_log():
-    data = request.json
-    log_line = data.get("log")
-
-    if not log_line:
-        return {"error": "Brak loga"}, 400
-
-    killer, victim, weapon, x, y = parse_log_entry(log_line)
-
-    if None in (killer, victim, weapon, x, y):
-        return {"error": "Nieprawidłowe dane loga"}, 400
-
-    image = generate_image(x, y, killer, victim, weapon)
-    content = f"☠️ {killer} zabił {victim} przy użyciu `{weapon}` na współrzędnych **X={int(x)}, Y={int(y)}**"
-
-    send_to_discord(image, content)
-    return {"status": "OK"}, 200
+def send_to_discord(image_path):
+    with open(image_path, "rb") as f:
+        files = {"file": (image_path, f)}
+        data = {"content": "🎯 Nowe zabójstwo zgłoszone przez Discovery Bot"}
+        response = requests.post(WEBHOOK_URL, data=data, files=files)
+        if response.status_code != 204:
+            print("Błąd wysyłania do Discord:", response.status_code, response.text)
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    with open("log.txt", "r") as file:
+        log_text = file.read()
+
+    parsed = parse_log(log_text)
+    if parsed:
+        image = generate_image(parsed)
+        send_to_discord(image)
+    else:
+        print("Nie znaleziono danych w logu.")
