@@ -1,82 +1,64 @@
 import os
-import math
-import requests
+from flask import Flask, request, send_file
 from PIL import Image, ImageDraw, ImageFont
 
-def world_to_tile_coords(x, y, zoom=6):
-    map_size = 600000  # SCUM map size in cm
-    normalized_x = (x / map_size) % 1.0
-    normalized_y = (0.5 - (y / map_size)) % 1.0
-    n = 2 ** zoom
-    xtile = normalized_x * n
-    ytile = normalized_y * n
-    return xtile, ytile
+app = Flask(__name__)
 
-def fetch_map_tiles(center_xtile, center_ytile, zoom, tile_size=256):
-    image = Image.new("RGB", (tile_size * 3, tile_size * 3))
-    for dx in range(-1, 2):
-        for dy in range(-1, 2):
-            tx = int(center_xtile) + dx
-            ty = int(center_ytile) + dy
-            url = f"https://scum-map.com/tiles/{zoom}/{tx}/{ty}.png"
-            try:
-                response = requests.get(url)
-                tile = Image.open(requests.compat.BytesIO(response.content))
-                image.paste(tile, ((dx + 1) * tile_size, (dy + 1) * tile_size))
-            except Exception as e:
-                print(f"Failed to fetch tile {tx},{ty}: {e}")
-    return image
+# Ścieżki do zasobów
+MAP_PATH = "assets/map.png"
+PIN_PATH = "assets/pin.png"
+FONT_PATH = "assets/font.ttf"
 
-def draw_marker_on_map(image, xtile, ytile, tile_size=256):
-    draw = ImageDraw.Draw(image)
-    offset_x = (xtile % 1.0) * tile_size + tile_size
-    offset_y = (ytile % 1.0) * tile_size + tile_size
-    draw.ellipse((offset_x - 10, offset_y - 10, offset_x + 10, offset_y + 10), fill="red", outline="white", width=2)
+# Rozmiar mapy SCUM i jej offsety (na bazie https://scum-map.com)
+MAP_WIDTH = 4096
+MAP_HEIGHT = 4096
+WORLD_MIN_X = 0
+WORLD_MAX_X = 600_000
+WORLD_MIN_Y = -300_000
+WORLD_MAX_Y = 0
 
-def add_text_overlay(image, killer, victim, weapon, distance):
-    draw = ImageDraw.Draw(image)
-    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-    if not os.path.exists(font_path):
-        font_path = None
-    font = ImageFont.truetype(font_path, 20) if font_path else None
-    text = f"{killer} killed {victim} with {weapon}\nDistance: {distance:.2f} m"
-    draw.text((10, 10), text, fill="white", font=font)
+def world_to_image_coords(x, y):
+    norm_x = (x - WORLD_MIN_X) / (WORLD_MAX_X - WORLD_MIN_X)
+    norm_y = (y - WORLD_MIN_Y) / (WORLD_MAX_Y - WORLD_MIN_Y)
+    pixel_x = int(norm_x * MAP_WIDTH)
+    pixel_y = int(norm_y * MAP_HEIGHT)
+    return pixel_x, pixel_y
 
-def generate_kill_webhook_image(log_data, output_path="kill_webhook_output.png"):
-    victim_x = log_data['Victim']['ServerLocation']['X']
-    victim_y = log_data['Victim']['ServerLocation']['Y']
-    xtile, ytile = world_to_tile_coords(victim_x, victim_y)
-    zoom = 6
-    map_img = fetch_map_tiles(xtile, ytile, zoom)
-    draw_marker_on_map(map_img, xtile, ytile)
+def draw_overlay(victim_name, killer_name, weapon_name, distance, pos_x, pos_y):
+    base = Image.open(MAP_PATH).convert("RGBA")
+    pin = Image.open(PIN_PATH).convert("RGBA").resize((48, 48))
 
-    killer = log_data['Killer']['ProfileName']
-    victim = log_data['Victim']['ProfileName']
-    weapon = log_data['Weapon'].split()[0].replace("_", " ")
-    distance = math.dist([
-        log_data['Killer']['ServerLocation']['X'],
-        log_data['Killer']['ServerLocation']['Y']
-    ], [
-        log_data['Victim']['ServerLocation']['X'],
-        log_data['Victim']['ServerLocation']['Y']
-    ])
+    pin_x, pin_y = world_to_image_coords(pos_x, pos_y)
+    base.paste(pin, (pin_x - 24, pin_y - 48), pin)
 
-    add_text_overlay(map_img, killer, victim, weapon, distance)
-    map_img.save(output_path)
-    print(f"Saved image to {output_path}")
+    draw = ImageDraw.Draw(base)
+    font = ImageFont.truetype(FONT_PATH, 32)
 
-# Example usage
-log = {
-    "Killer": {
-        "ServerLocation": {"X": 525405.75, "Y": -192209.703125, "Z": 1195.30},
-        "ProfileName": "Anu"
-    },
-    "Victim": {
-        "ServerLocation": {"X": 525345.625, "Y": -192173.53125, "Z": 1195.31},
-        "ProfileName": "Milo"
-    },
-    "Weapon": "2H_Katana_C_2147327617 [Melee]"
-}
+    text = f"{killer_name} ➤ {victim_name}\n🔪 {weapon_name} | 📏 {distance:.1f}m"
+    draw.text((pin_x + 20, pin_y - 40), text, font=font, fill=(255, 255, 255, 255))
+
+    output_path = "output/kill_overlay.png"
+    os.makedirs("output", exist_ok=True)
+    base.save(output_path)
+
+    return output_path
+
+@app.route("/webhook-image", methods=["POST"])
+def webhook_image():
+    data = request.json
+
+    victim_name = data["Victim"]["ProfileName"]
+    killer_name = data["Killer"]["ProfileName"]
+    weapon_str = data["Weapon"]
+    distance = float(data.get("Distance", 0))
+    pos_x = float(data["Victim"]["ServerLocation"]["X"])
+    pos_y = float(data["Victim"]["ServerLocation"]["Y"])
+
+    # Wyodrębnij tylko nazwę broni
+    weapon_clean = weapon_str.split()[0].replace("_", " ")
+
+    image_path = draw_overlay(victim_name, killer_name, weapon_clean, distance, pos_x, pos_y)
+    return send_file(image_path, mimetype='image/png')
 
 if __name__ == "__main__":
-    generate_kill_webhook_image(log)
+    app.run(debug=True)
