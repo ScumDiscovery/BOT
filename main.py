@@ -2,50 +2,78 @@ import os
 import re
 import json
 import io
-from flask import Flask, send_file
-from PIL import Image, ImageDraw, ImageFont
+import math
 import requests
+from flask import Flask, send_file, request
+from PIL import Image, ImageDraw, ImageFont
+from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 
-# Ścieżki do zasobów
-MAP_PATH = "assets/map.png"
-ICON_PATH = "assets/skull.png"
+# Config
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 FONT_PATH = "assets/Roboto-Bold.ttf"
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")  # Można ustawić w Render.com jako env var
+TILE_SIZE = 256  # rozmiar kafla z mapy
 
-# Wymiary mapy i offsety (przykład; muszą pasować do Twojej mapy!)
-MAP_WIDTH = 2048
-MAP_HEIGHT = 2048
-MAP_X_MIN = 500000  # Przykład: minimalna wartość X
-MAP_X_MAX = 530000  # Przykład: maksymalna wartość X
-MAP_Y_MIN = -195000
-MAP_Y_MAX = -190000
+# Zakres koordynat, dostosuj do swojej mapy
+MAP_X_MIN, MAP_X_MAX = 500000, 530000
+MAP_Y_MIN, MAP_Y_MAX = -195000, -190000
+MAP_ZOOM = 5  # dostosuj w zależności od poziomu szczegółów
 
-def map_coords_to_pixels(x, y):
-    """Konwertuje współrzędne świata gry na piksele na mapie"""
-    px = int(((x - MAP_X_MIN) / (MAP_X_MAX - MAP_X_MIN)) * MAP_WIDTH)
-    py = int(((y - MAP_Y_MIN) / (MAP_Y_MAX - MAP_Y_MIN)) * MAP_HEIGHT)
-    return px, MAP_HEIGHT - py  # Odwracamy oś Y, jeśli mapa jest "do góry nogami"
+def map_coords_to_pixels(x, y, map_img):
+    width, height = map_img.size
+    px = ((x - MAP_X_MIN) / (MAP_X_MAX - MAP_X_MIN)) * width
+    py = ((y - MAP_Y_MIN) / (MAP_Y_MAX - MAP_Y_MIN)) * height
+    return int(px), int(height - py)
 
-def generate_kill_image(killer, victim, weapon, distance, location):
-    """Tworzy obrazek z mapą i oznaczeniem zabójstwa"""
-    map_img = Image.open(MAP_PATH).convert("RGBA")
-    skull = Image.open(ICON_PATH).convert("RGBA")
-    skull = skull.resize((64, 64))  # Zmniejszamy ikonkę czaszki
+def fetch_map_for_location(x, y):
+    """Pobiera 3x3 kafle centrowane na lokalizacji (x, y)"""
+    # Przekształć na tile coords (przykład – zależy od implementacji Serwera)
+    def world_to_tile(wx, wy, zoom):
+        tx = int((wx - MAP_X_MIN) / (MAP_X_MAX - MAP_X_MIN) * (2**zoom))
+        ty = int((wy - MAP_Y_MIN) / (MAP_Y_MAX - MAP_Y_MIN) * (2**zoom))
+        return tx, ty
 
+    center_tx, center_ty = world_to_tile(x, y, MAP_ZOOM)
+    full = Image.new("RGBA", (TILE_SIZE*3, TILE_SIZE*3))
+
+    for dx in range(-1, 2):
+        for dy in range(-1, 2):
+            tx, ty = center_tx+dx, center_ty+dy
+            url = f"https://scum-map.com/tiles/{MAP_ZOOM}/{tx}/{ty}.png"
+            resp = requests.get(url)
+            if resp.status_code == 200:
+                tile = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+            else:
+                tile = Image.new("RGBA", (TILE_SIZE, TILE_SIZE), (0,0,0,0))
+            full.paste(tile, ((dx+1)*TILE_SIZE, (dy+1)*TILE_SIZE))
+    return full
+
+def fetch_weapon_icon(weapon_id):
+    """Pobiera z fandom np. 2H_Katana_C_2147327617"""
+    url = "https://scum.fandom.com/wiki/Item_IDs/Weapons"
+    resp = requests.get(url)
+    soup = BeautifulSoup(resp.text, "html.parser")
+    img = soup.find("img", alt=lambda a: a and weapon_id in a)
+    if img:
+        icon_url = img.get("src")
+        resp2 = requests.get(icon_url)
+        return Image.open(io.BytesIO(resp2.content)).convert("RGBA").resize((64,64))
+    else:
+        return Image.new("RGBA", (64,64), (255,0,0,128))  # fallback
+
+def generate_kill_image(killer, victim, weapon_id, distance, location):
+    x, y = location
+    map_img = fetch_map_for_location(x, y)
+    weapon_icon = fetch_weapon_icon(weapon_id)
     draw = ImageDraw.Draw(map_img)
+    px, py = map_coords_to_pixels(x, y, map_img)
+    map_img.paste(weapon_icon, (px-32, py-32), weapon_icon)
 
-    # Mapujemy współrzędne
-    px, py = map_coords_to_pixels(*location)
-    map_img.paste(skull, (px - 32, py - 32), skull)
-
-    # Dodajemy opis tekstowy
     font = ImageFont.truetype(FONT_PATH, 32)
-    text = f"{killer} → {victim}\n{weapon} ({distance:.1f} m)"
-    draw.text((20, 20), text, font=font, fill=(255, 255, 255, 255))
+    txt = f"{killer} → {victim}\n{weapon_id} ({distance:.1f} m)"
+    draw.text((20,20), txt, font=font, fill=(255,255,255,255))
 
-    # Zapisujemy do bufora
     buf = io.BytesIO()
     map_img.save(buf, format="PNG")
     buf.seek(0)
@@ -53,60 +81,31 @@ def generate_kill_image(killer, victim, weapon, distance, location):
 
 def send_to_discord(image_buf, message):
     if not DISCORD_WEBHOOK_URL:
-        print("⚠️ Brak DISCORD_WEBHOOK_URL — pomijam wysyłkę.")
+        print("⚠️ No webhook URL.")
         return
+    files = {"file": ("kill.png", image_buf, "image/png")}
+    data = {"content": message}
+    resp = requests.post(DISCORD_WEBHOOK_URL, data=data, files=files)
+    if resp.status_code != 204:
+        print("📛 Discord send error:", resp.status_code, resp.text)
 
-    files = {
-        "file": ("killmap.png", image_buf, "image/png")
-    }
-    data = {
-        "content": message
-    }
-    response = requests.post(DISCORD_WEBHOOK_URL, data=data, files=files)
+@app.route("/kill", methods=["POST"])
+def kill_endpoint():
+    data = request.json or {}
+    for key in ("killer","victim","weapon","distance","x","y"):
+        if key not in data:
+            return {"error": f"Missing '{key}'"}, 400
 
-    if response.status_code != 204:
-        print("❌ Błąd wysyłki do Discorda:", response.status_code, response.text)
-    else:
-        print("✅ Wysłano grafikę na Discorda.")
+    killer = data["killer"]
+    victim = data["victim"]
+    weapon = data["weapon"]
+    distance = float(data["distance"])
+    x, y = float(data["x"]), float(data["y"])
 
-@app.route("/test", methods=["GET"])
-def test_manual_log():
-    # Testowy log (UTF-16LE oryginalnie — tu konwertowany do UTF-8 jako string)
-    log_utf16le = """
-2025.06.15-14.25.15: Died: Milo (76561199447029491), Killer: Anu (76561197992396189) Weapon: 2H_Katana_C_2147327617 [Melee] S:[KillerLoc : 525405.75, -192209.70, 1195.30 VictimLoc: 525345.62, -192173.53, 1195.31, Distance: 0.70 m]
-2025.06.15-14.25.15: {"Killer":{"ServerLocation":{"X": 525405.75,"Y": -192209.703125,"Z": 1195.2999267578125},"ClientLocation":{"X": 525405.75,"Y": -192209.703125,"Z": 1195.2999267578125},"IsInGameEvent": false,"ProfileName": "Anu","UserId": "76561197992396189","HasImmortality": false},"Victim":{"ServerLocation":{"X": 525345.625,"Y": -192173.53125,"Z": 1195.3099365234375},"ClientLocation":{"X": 525345.625,"Y": -192173.53125,"Z": 1195.3099365234375},"IsInGameEvent": false,"ProfileName": "Milo","UserId": "76561199447029491"},"Weapon": "2H_Katana_C_2147327617 [Melee]","TimeOfDay": "06:17:04"}
-""".strip()
+    img_buf = generate_kill_image(killer, victim, weapon, distance, (x,y))
+    send_to_discord(img_buf, f"{killer} killed {victim} with {weapon} ({distance:.1f} m)")
+    img_buf.seek(0)
+    return send_file(img_buf, mimetype="image/png")
 
-    # Parsowanie JSON-a
-    lines = log_utf16le.splitlines()
-    json_line = [l for l in lines if l.strip().endswith("}")]
-    if not json_line:
-        return {"error": "Nie znaleziono danych JSON"}, 400
-
-    log_data = json.loads(json_line[0].split(":", 1)[-1].strip())
-
-    killer = log_data["Killer"]["ProfileName"]
-    victim = log_data["Victim"]["ProfileName"]
-    weapon_full = log_data["Weapon"]
-    weapon = weapon_full.split(" [")[0]
-    x = float(log_data["Killer"]["ServerLocation"]["X"])
-    y = float(log_data["Killer"]["ServerLocation"]["Y"])
-
-    # Parsowanie dystansu z pierwszej linii
-    dist_match = re.search(r"Distance:\s*([\d\.]+)\s*m", lines[0])
-    distance = float(dist_match.group(1)) if dist_match else 0.0
-
-    # Generowanie grafiki
-    image_buf = generate_kill_image(killer, victim, weapon, distance, (x, y))
-
-    # Wysyłka na Discorda
-    message = f"{killer} zabił {victim} ({weapon}) z {distance:.1f} m"
-    send_to_discord(image_buf, message)
-
-    # Zwróć obraz lokalnie (dla testu)
-    image_buf.seek(0)
-    return send_file(image_buf, mimetype="image/png")
-
-@app.route("/")
-def hello():
-    return "Serwer działa. Użyj /test aby wygenerować mapę."
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
