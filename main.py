@@ -1,116 +1,112 @@
 import os
 import re
-import requests
-from flask import Flask, request
+import json
+import io
+from flask import Flask, send_file
 from PIL import Image, ImageDraw, ImageFont
-from io import BytesIO
-from dotenv import load_dotenv
+import requests
 
-load_dotenv()
 app = Flask(__name__)
 
-WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+# Ścieżki do zasobów
+MAP_PATH = "assets/map.png"
+ICON_PATH = "assets/skull.png"
+FONT_PATH = "assets/Roboto-Bold.ttf"
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")  # Można ustawić w Render.com jako env var
 
-TILE_SIZE = 256
-MAP_TILE_URL = "https://scum-map.com/api/maps/1/tiles/0/{x}/{y}.png"
+# Wymiary mapy i offsety (przykład; muszą pasować do Twojej mapy!)
+MAP_WIDTH = 2048
+MAP_HEIGHT = 2048
+MAP_X_MIN = 500000  # Przykład: minimalna wartość X
+MAP_X_MAX = 530000  # Przykład: maksymalna wartość X
+MAP_Y_MIN = -195000
+MAP_Y_MAX = -190000
 
-# Czaszka – lokalnie lub URL
-SKULL_ICON_URL = "https://upload.wikimedia.org/wikipedia/commons/thumb/e/e9/Skull_icon.svg/240px-Skull_icon.svg.png"
-
-def fetch_tile(x, y):
-    try:
-        url = MAP_TILE_URL.format(x=x, y=y)
-        response = requests.get(url)
-        response.raise_for_status()
-        return Image.open(BytesIO(response.content)).convert("RGBA")
-    except Exception as e:
-        print(f"Tile error {x},{y}: {e}")
-        return Image.new("RGBA", (TILE_SIZE, TILE_SIZE), (0, 0, 0, 255))
-
-def fetch_icon(url, size=(48, 48)):
-    try:
-        response = requests.get(url)
-        response.raise_for_status()
-        icon = Image.open(BytesIO(response.content)).convert("RGBA")
-        return icon.resize(size)
-    except Exception as e:
-        print(f"Icon fetch failed: {e}")
-        return None
-
-def map_coords_to_tile(x, y):
-    """SCUM map is approx 6x6 km, tiles go from 0–7 on each axis"""
-    px = int(x / TILE_SIZE)
-    py = int(abs(y) / TILE_SIZE)
-    return px, py
+def map_coords_to_pixels(x, y):
+    """Konwertuje współrzędne świata gry na piksele na mapie"""
+    px = int(((x - MAP_X_MIN) / (MAP_X_MAX - MAP_X_MIN)) * MAP_WIDTH)
+    py = int(((y - MAP_Y_MIN) / (MAP_Y_MAX - MAP_Y_MIN)) * MAP_HEIGHT)
+    return px, MAP_HEIGHT - py  # Odwracamy oś Y, jeśli mapa jest "do góry nogami"
 
 def generate_kill_image(killer, victim, weapon, distance, location):
-    # Ustawiamy środek na zabójstwo
-    x, y = location
-    center_tile_x, center_tile_y = map_coords_to_tile(x, y)
+    """Tworzy obrazek z mapą i oznaczeniem zabójstwa"""
+    map_img = Image.open(MAP_PATH).convert("RGBA")
+    skull = Image.open(ICON_PATH).convert("RGBA")
+    skull = skull.resize((64, 64))  # Zmniejszamy ikonkę czaszki
 
-    # Składamy mapę 3x3
-    map_image = Image.new("RGBA", (TILE_SIZE * 3, TILE_SIZE * 3))
-    for dx in range(-1, 2):
-        for dy in range(-1, 2):
-            tile = fetch_tile(center_tile_x + dx, center_tile_y + dy)
-            map_image.paste(tile, ((dx + 1) * TILE_SIZE, (dy + 1) * TILE_SIZE))
+    draw = ImageDraw.Draw(map_img)
 
-    # Przeliczenie pozycji czaszki
-    offset_x = int(x % TILE_SIZE) + TILE_SIZE
-    offset_y = int(abs(y % TILE_SIZE)) + TILE_SIZE
+    # Mapujemy współrzędne
+    px, py = map_coords_to_pixels(*location)
+    map_img.paste(skull, (px - 32, py - 32), skull)
 
-    skull = fetch_icon(SKULL_ICON_URL)
-    if skull:
-        map_image.paste(skull, (offset_x - 24, offset_y - 24), mask=skull)
+    # Dodajemy opis tekstowy
+    font = ImageFont.truetype(FONT_PATH, 32)
+    text = f"{killer} → {victim}\n{weapon} ({distance:.1f} m)"
+    draw.text((20, 20), text, font=font, fill=(255, 255, 255, 255))
 
-    # Dodajemy tekst
-    draw = ImageDraw.Draw(map_image)
-    font = ImageFont.load_default()
+    # Zapisujemy do bufora
+    buf = io.BytesIO()
+    map_img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
 
-    info = f"{killer} ➜ {victim}\n{weapon}\n📏 {distance:.1f} m"
-    draw.text((10, 10), info, fill="red", font=font)
+def send_to_discord(image_buf, message):
+    if not DISCORD_WEBHOOK_URL:
+        print("⚠️ Brak DISCORD_WEBHOOK_URL — pomijam wysyłkę.")
+        return
 
-    output_path = "kill_output.png"
-    map_image.save(output_path)
-    return output_path
+    files = {
+        "file": ("killmap.png", image_buf, "image/png")
+    }
+    data = {
+        "content": message
+    }
+    response = requests.post(DISCORD_WEBHOOK_URL, data=data, files=files)
 
-def send_to_discord(file_path, message):
-    with open(file_path, "rb") as f:
-        response = requests.post(
-            WEBHOOK_URL,
-            files={"file": (os.path.basename(file_path), f)},
-            data={"content": message}
-        )
-    if response.status_code >= 400:
-        print(f"Webhook error: {response.status_code} {response.text}")
+    if response.status_code != 204:
+        print("❌ Błąd wysyłki do Discorda:", response.status_code, response.text)
+    else:
+        print("✅ Wysłano grafikę na Discorda.")
 
-@app.route("/", methods=["GET"])
-def index():
-    return "<h3>SCUM Killfeed Bot działa</h3>", 200
+@app.route("/test", methods=["GET"])
+def test_manual_log():
+    # Testowy log (UTF-16LE oryginalnie — tu konwertowany do UTF-8 jako string)
+    log_utf16le = """
+2025.06.15-14.25.15: Died: Milo (76561199447029491), Killer: Anu (76561197992396189) Weapon: 2H_Katana_C_2147327617 [Melee] S:[KillerLoc : 525405.75, -192209.70, 1195.30 VictimLoc: 525345.62, -192173.53, 1195.31, Distance: 0.70 m]
+2025.06.15-14.25.15: {"Killer":{"ServerLocation":{"X": 525405.75,"Y": -192209.703125,"Z": 1195.2999267578125},"ClientLocation":{"X": 525405.75,"Y": -192209.703125,"Z": 1195.2999267578125},"IsInGameEvent": false,"ProfileName": "Anu","UserId": "76561197992396189","HasImmortality": false},"Victim":{"ServerLocation":{"X": 525345.625,"Y": -192173.53125,"Z": 1195.3099365234375},"ClientLocation":{"X": 525345.625,"Y": -192173.53125,"Z": 1195.3099365234375},"IsInGameEvent": false,"ProfileName": "Milo","UserId": "76561199447029491"},"Weapon": "2H_Katana_C_2147327617 [Melee]","TimeOfDay": "06:17:04"}
+""".strip()
 
-@app.route("/kill", methods=["POST"])
-def kill():
-    data = request.get_json()
+    # Parsowanie JSON-a
+    lines = log_utf16le.splitlines()
+    json_line = [l for l in lines if l.strip().endswith("}")]
+    if not json_line:
+        return {"error": "Nie znaleziono danych JSON"}, 400
 
-    killer = data.get("Killer", {}).get("ProfileName", "Unknown")
-    victim = data.get("Victim", {}).get("ProfileName", "Unknown")
-    weapon_raw = data.get("Weapon", "Unknown Weapon")
-    weapon = weapon_raw.split(" [")[0]  # np. "2H_Katana_C_..." → "2H_Katana_C_..."
+    log_data = json.loads(json_line[0].split(":", 1)[-1].strip())
 
-    # Lokacja zabójcy
-    loc = data.get("Killer", {}).get("ServerLocation", {})
-    x = float(loc.get("X", 55000))
-    y = float(loc.get("Y", 51000))  # Uwaga: SCUM ma oś Y ujemną
+    killer = log_data["Killer"]["ProfileName"]
+    victim = log_data["Victim"]["ProfileName"]
+    weapon_full = log_data["Weapon"]
+    weapon = weapon_full.split(" [")[0]
+    x = float(log_data["Killer"]["ServerLocation"]["X"])
+    y = float(log_data["Killer"]["ServerLocation"]["Y"])
 
-    # Próbujemy wydobyć dystans z logu, jeśli podano
-    distance_match = re.search(r"Distance:\s*([\d\.]+)\s*m", weapon_raw)
-    distance = float(distance_match.group(1)) if distance_match else 0.0
+    # Parsowanie dystansu z pierwszej linii
+    dist_match = re.search(r"Distance:\s*([\d\.]+)\s*m", lines[0])
+    distance = float(dist_match.group(1)) if dist_match else 0.0
 
-    image_path = generate_kill_image(killer, victim, weapon, distance, (x, y))
-    message = f"💀 {killer} zabił {victim} ({distance:.1f} m) przy użyciu `{weapon}`"
-    send_to_discord(image_path, message)
+    # Generowanie grafiki
+    image_buf = generate_kill_image(killer, victim, weapon, distance, (x, y))
 
-    return {"status": "ok"}, 200
+    # Wysyłka na Discorda
+    message = f"{killer} zabił {victim} ({weapon}) z {distance:.1f} m"
+    send_to_discord(image_buf, message)
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+    # Zwróć obraz lokalnie (dla testu)
+    image_buf.seek(0)
+    return send_file(image_buf, mimetype="image/png")
+
+@app.route("/")
+def hello():
+    return "Serwer działa. Użyj /test aby wygenerować mapę."
