@@ -1,102 +1,82 @@
-import ftplib
-import io
-import json
-import re
-import time
+import os
+import math
 import requests
-from threading import Thread
-from flask import Flask
+from PIL import Image, ImageDraw, ImageFont
 
-# --- KONFIGURACJA ---
-FTP_HOST = "176.57.174.10"
-FTP_PORT = 50021
-FTP_USER = "gpftp37275281717442833"
-FTP_PASS = "LXNdGShY"
-FTP_LOG_DIR = "/SCUM/Saved/SaveFiles/Logs"
+def world_to_tile_coords(x, y, zoom=6):
+    map_size = 600000  # SCUM map size in cm
+    normalized_x = (x / map_size) % 1.0
+    normalized_y = (0.5 - (y / map_size)) % 1.0
+    n = 2 ** zoom
+    xtile = normalized_x * n
+    ytile = normalized_y * n
+    return xtile, ytile
 
-DISCORD_WEBHOOK = "https://discord.com/api/webhooks/xxx/yyy"
+def fetch_map_tiles(center_xtile, center_ytile, zoom, tile_size=256):
+    image = Image.new("RGB", (tile_size * 3, tile_size * 3))
+    for dx in range(-1, 2):
+        for dy in range(-1, 2):
+            tx = int(center_xtile) + dx
+            ty = int(center_ytile) + dy
+            url = f"https://scum-map.com/tiles/{zoom}/{tx}/{ty}.png"
+            try:
+                response = requests.get(url)
+                tile = Image.open(requests.compat.BytesIO(response.content))
+                image.paste(tile, ((dx + 1) * tile_size, (dy + 1) * tile_size))
+            except Exception as e:
+                print(f"Failed to fetch tile {tx},{ty}: {e}")
+    return image
 
-POLL_INTERVAL = 15  # sekund
+def draw_marker_on_map(image, xtile, ytile, tile_size=256):
+    draw = ImageDraw.Draw(image)
+    offset_x = (xtile % 1.0) * tile_size + tile_size
+    offset_y = (ytile % 1.0) * tile_size + tile_size
+    draw.ellipse((offset_x - 10, offset_y - 10, offset_x + 10, offset_y + 10), fill="red", outline="white", width=2)
 
-app = Flask(__name__)
+def add_text_overlay(image, killer, victim, weapon, distance):
+    draw = ImageDraw.Draw(image)
+    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    if not os.path.exists(font_path):
+        font_path = None
+    font = ImageFont.truetype(font_path, 20) if font_path else None
+    text = f"{killer} killed {victim} with {weapon}\nDistance: {distance:.2f} m"
+    draw.text((10, 10), text, fill="white", font=font)
 
-processed_files = set()  # pliki już przetworzone
+def generate_kill_webhook_image(log_data, output_path="kill_webhook_output.png"):
+    victim_x = log_data['Victim']['ServerLocation']['X']
+    victim_y = log_data['Victim']['ServerLocation']['Y']
+    xtile, ytile = world_to_tile_coords(victim_x, victim_y)
+    zoom = 6
+    map_img = fetch_map_tiles(xtile, ytile, zoom)
+    draw_marker_on_map(map_img, xtile, ytile)
 
-def send_discord_message(content: str):
-    data = {"content": content}
-    try:
-        resp = requests.post(DISCORD_WEBHOOK, json=data)
-        if resp.status_code != 204 and resp.status_code != 200:
-            print(f"[!] Discord webhook error: {resp.status_code} {resp.text}")
-    except Exception as e:
-        print(f"[!] Discord webhook exception: {e}")
+    killer = log_data['Killer']['ProfileName']
+    victim = log_data['Victim']['ProfileName']
+    weapon = log_data['Weapon'].split()[0].replace("_", " ")
+    distance = math.dist([
+        log_data['Killer']['ServerLocation']['X'],
+        log_data['Killer']['ServerLocation']['Y']
+    ], [
+        log_data['Victim']['ServerLocation']['X'],
+        log_data['Victim']['ServerLocation']['Y']
+    ])
 
-def parse_log_content(log_content: str):
-    """
-    Parsuje zawartość pliku log (tekst), wyciąga zabójstwa i wysyła na Discord.
-    Format pliku wg WhalleyBot:
-    - linia z "Died:"
-    - następna linia to JSON z info o zabójstwie
-    """
-    lines = log_content.splitlines()
-    for i, line in enumerate(lines):
-        if "Died:" in line:
-            if i + 1 < len(lines):
-                json_line = lines[i + 1].strip()
-                try:
-                    data = json.loads(json_line)
-                    killer = data.get("KillerName", "Unknown")
-                    victim = data.get("PlayerName", "Unknown")
-                    weapon = data.get("KillerWeapon", "Unknown")
-                    msg = f"💀 {victim} został zabity przez {killer} bronią {weapon}"
-                    print(f"[INFO] {msg}")
-                    send_discord_message(msg)
-                except json.JSONDecodeError:
-                    print("[!] Nie udało się sparsować JSON-a w logu")
-            else:
-                print("[!] Brak JSON-a po linii 'Died:'")
+    add_text_overlay(map_img, killer, victim, weapon, distance)
+    map_img.save(output_path)
+    print(f"Saved image to {output_path}")
 
-def ftp_loop():
-    global processed_files
-    while True:
-        try:
-            print("[BOT] Łączenie z FTP...")
-            ftp = ftplib.FTP()
-            ftp.connect(FTP_HOST, FTP_PORT, timeout=10)
-            ftp.login(FTP_USER, FTP_PASS)
-            ftp.cwd(FTP_LOG_DIR)
-
-            files = ftp.nlst()
-            kill_logs = [f for f in files if f.startswith("kill_") and f.endswith(".log")]
-
-            for filename in kill_logs:
-                if filename in processed_files:
-                    continue
-
-                print(f"[BOT] Pobieram i analizuję: {filename}")
-                bio = io.BytesIO()
-                ftp.retrbinary(f"RETR {filename}", bio.write)
-                bio.seek(0)
-                content = bio.read().decode("utf-8", errors="ignore")
-
-                parse_log_content(content)
-
-                processed_files.add(filename)
-            ftp.quit()
-        except Exception as e:
-            print(f"[!] Błąd FTP lub parsowania: {e}")
-
-        time.sleep(POLL_INTERVAL)
-
-# Flask endpoint do health checka
-@app.route("/")
-def index():
-    return "SCUM Bot działa!"
+# Example usage
+log = {
+    "Killer": {
+        "ServerLocation": {"X": 525405.75, "Y": -192209.703125, "Z": 1195.30},
+        "ProfileName": "Anu"
+    },
+    "Victim": {
+        "ServerLocation": {"X": 525345.625, "Y": -192173.53125, "Z": 1195.31},
+        "ProfileName": "Milo"
+    },
+    "Weapon": "2H_Katana_C_2147327617 [Melee]"
+}
 
 if __name__ == "__main__":
-    print("[BOT] Startuję pętlę FTP w tle...")
-    thread = Thread(target=ftp_loop, daemon=True)
-    thread.start()
-
-    # Uruchom flask na porcie 10000, dostępny z każdego IP (ważne na Render)
-    app.run(host="0.0.0.0", port=10000)
+    generate_kill_webhook_image(log)
