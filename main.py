@@ -1,81 +1,94 @@
 import os
-import json
+import re
 import requests
 from PIL import Image, ImageDraw, ImageFont
-from config import WEBHOOK_URL, MAP_PATH, BASE_TEMPLATE_PATH, WEAPON_ICONS_PATH
 
-def parse_log(log_text):
-    lines = log_text.splitlines()
-    for line in lines:
-        if "Died:" in line and "KillerLoc" in line:
-            coords_start = line.find("KillerLoc :") + len("KillerLoc :")
-            coords_end = line.find("VictimLoc")
-            killer_coords = line[coords_start:coords_end].strip().strip(',').split(',')
-            killer_x = float(killer_coords[0])
-            killer_y = float(killer_coords[1])
-        if line.startswith("{\"Killer\""):
-            data = json.loads(line)
-            return {
-                "killer": data["Killer"]["ProfileName"],
-                "victim": data["Victim"]["ProfileName"],
-                "weapon": data["Weapon"].split(' ')[0],
-                "location": (killer_x, killer_y),
-                "time": data["TimeOfDay"]
-            }
-    return None
+# 🔧 KONFIGURACJA
+WEBHOOK_URL = "https://discord.com/api/webhooks/1383407890663997450/hr2zvr2PjO20IDLIk5nZd8juZDxG9kYkOOZ0c2_sqzGtuXra8Dz-HbhtnhtF3Yb0Hsgi"
+MAP_IMAGE_PATH = "assets/map_full.jpg"
+WEAPON_ICONS = {
+    "2H_Katana": "assets/katana.png"
+}
+FONT_PATH = "assets/font.ttf"
+LOG_PATH = "logs/scum_log.txt"
+OUTPUT_PATH = "output/final.png"
 
-def crop_map(location, size=400):
-    x, y = location
-    full_map = Image.open(MAP_PATH)
-    map_width, map_height = full_map.size
-    game_map_width = 600000
-    game_map_height = 600000
-    px = int((x / game_map_width) * map_width)
-    py = int((abs(y) / game_map_height) * map_height)
-    left = max(px - size // 2, 0)
-    top = max(py - size // 2, 0)
-    right = min(px + size // 2, map_width)
-    bottom = min(py + size // 2, map_height)
-    return full_map.crop((left, top, right, bottom)).resize((size, size))
+# 🔍 PARSER LOGÓW
+def parse_log(log_path):
+    with open(log_path, "r") as f:
+        content = f.read()
 
-def generate_image(data):
-    base = Image.open(BASE_TEMPLATE_PATH).convert("RGBA")
+    match = re.search(
+        r"Died: (.+?) \((\d+)\), Killer: (.+?) \((\d+)\) Weapon: (.+?) \[.*?\] S:\[KillerLoc : ([\d\.-]+), ([\d\.-]+), .*? VictimLoc: ([\d\.-]+), ([\d\.-]+)",
+        content
+    )
+
+    if not match:
+        raise ValueError("Nie znaleziono poprawnych danych w logu.")
+
+    victim, victim_id, killer, killer_id, weapon_str, killer_x, killer_y, victim_x, victim_y = match.groups()
+
+    return {
+        "killer": killer,
+        "killer_id": killer_id,
+        "victim": victim,
+        "victim_id": victim_id,
+        "weapon": weapon_str.split("_C_")[0],
+        "killer_coords": (float(killer_x), float(killer_y)),
+        "victim_coords": (float(victim_x), float(victim_y))
+    }
+
+# 🗺️ WYCIĘCIE FRAGMENTU MAPY
+def crop_map(coords, size=300):
+    map_img = Image.open(MAP_IMAGE_PATH)
+    x, y = coords
+
+    # Przeliczenie koordynatów gry na piksele obrazu (zakładamy proporcje mapy np. 6x6 km = 6000x6000 px)
+    map_width, map_height = map_img.size
+    px = int(x / 1000000 * map_width)
+    py = int((abs(y)) / 1000000 * map_height)
+
+    # Wycinamy fragment wokół koordynatów
+    box = (px - size // 2, py - size // 2, px + size // 2, py + size // 2)
+    cropped = map_img.crop(box)
+    return cropped.resize((800, 800))
+
+# 🎨 GENERATOR GRAFIKI
+def create_image(data):
+    base = crop_map(data["killer_coords"])
     draw = ImageDraw.Draw(base)
-    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-    font = ImageFont.truetype(font_path, 24)
+    font = ImageFont.truetype(FONT_PATH, 40)
 
-    cropped_map = crop_map(data["location"], size=300)
-    base.paste(cropped_map, (30, 30))
+    # Tekst
+    draw.text((30, 20), f"{data['killer']} zabił {data['victim']}", fill="white", font=font)
+    draw.text((30, 80), f"Broń: {data['weapon']}", fill="orange", font=font)
 
-    weapon_icon_path = os.path.join(WEAPON_ICONS_PATH, "katana.png")
-    if os.path.exists(weapon_icon_path):
-        weapon_icon = Image.open(weapon_icon_path).convert("RGBA").resize((64, 64))
-        base.paste(weapon_icon, (360, 30), weapon_icon)
+    # Ikona broni
+    weapon_key = next((key for key in WEAPON_ICONS if key in data["weapon"]), None)
+    if weapon_key:
+        weapon_img = Image.open(WEAPON_ICONS[weapon_key]).convert("RGBA").resize((128, 128))
+        base.paste(weapon_img, (base.width - 150, 30), weapon_img)
 
-    draw.text((30, 350), f"Killer: {data['killer']}", font=font, fill="white")
-    draw.text((30, 390), f"Victim: {data['victim']}", font=font, fill="white")
-    draw.text((30, 430), f"Weapon: {data['weapon']}", font=font, fill="white")
-    draw.text((30, 470), f"Time: {data['time']}", font=font, fill="white")
+    base.save(OUTPUT_PATH)
+    return OUTPUT_PATH
 
-    out_path = "kill_report.png"
-    base.save(out_path)
-    return out_path
-
+# 📤 WYŚLIJ NA DISCORD
 def send_to_discord(image_path):
-    with open(image_path, "rb") as f:
-        files = {"file": (image_path, f)}
-        data = {"content": "🎯 Nowe zabójstwo zgłoszone przez Discovery Bot"}
-        response = requests.post(WEBHOOK_URL, data=data, files=files)
-        if response.status_code != 204:
-            print("Błąd wysyłania do Discord:", response.status_code, response.text)
+    with open(image_path, 'rb') as img:
+        files = {'file': (os.path.basename(image_path), img, 'image/png')}
+        response = requests.post(WEBHOOK_URL, files=files)
 
-if __name__ == "__main__":
-    with open("log.txt", "r") as file:
-        log_text = file.read()
-
-    parsed = parse_log(log_text)
-    if parsed:
-        image = generate_image(parsed)
-        send_to_discord(image)
+    if response.status_code == 204:
+        print("✅ Wysłano na Discord!")
     else:
-        print("Nie znaleziono danych w logu.")
+        print(f"❌ Błąd wysyłania: {response.status_code}")
+
+# ▶️ GŁÓWNE WYWOŁANIE
+if __name__ == "__main__":
+    try:
+        data = parse_log(LOG_PATH)
+        print("✅ Zparsowano dane:", data)
+        img_path = create_image(data)
+        send_to_discord(img_path)
+    except Exception as e:
+        print("❌ Błąd:", str(e))
