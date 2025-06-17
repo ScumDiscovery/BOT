@@ -1,103 +1,100 @@
 import os
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request
 from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
 from dotenv import load_dotenv
 
 load_dotenv()
-
 app = Flask(__name__)
 
-TILE_URL = "https://tiles.stadiamaps.com/tiles/alidade_smooth/{z}/{x}/{y}.png"
-TILE_SIZE = 256
-ZOOM = 6
+WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-# Example static weapon icon fallback (override below with dynamic)
-STATIC_ICONS = {
-    "BP_Weapon_AK47": "https://static.wikia.nocookie.net/scum/images/5/5b/AK-47.png",
+TILE_SIZE = 256
+MAP_TILE_URL = "https://scum-map.com/api/maps/1/tiles/0/{x}/{y}.png"
+WEAPON_ICON_URL_TEMPLATE = "https://static.wikia.nocookie.net/scum_gamepedia/images/{hash}.png"
+
+# Tymczasowy fallback – docelowo można zbudować mapę ID → hash
+WEAPON_ICON_OVERRIDES = {
+    "BP_Weapon_AK47": "f/f0/AK-47_Icon.png",
+    "BP_Weapon_M1": "3/3a/M1_Garand_Icon.png",
+    "BP_Weapon_Deagle50": "b/bc/Deagle_Icon.png",
 }
 
-# Map SCUM coordinates to tile grid (approximate)
-def coords_to_tile(x, y):
-    return int(x / 1000), int(y / 1000)
-
-def get_tile(x, y):
-    url = TILE_URL.format(z=ZOOM, x=x, y=y)
+def fetch_tile(x, y):
     try:
-        r = requests.get(url)
-        r.raise_for_status()
-        return Image.open(BytesIO(r.content)).convert("RGB")
+        url = MAP_TILE_URL.format(x=x, y=y)
+        response = requests.get(url)
+        response.raise_for_status()
+        return Image.open(BytesIO(response.content)).convert("RGBA")
     except Exception as e:
         print(f"Failed to fetch tile {x},{y}: {e}")
-        return Image.new("RGB", (TILE_SIZE, TILE_SIZE), color=(50, 50, 50))
-
-def stitch_map(center_x, center_y):
-    base = Image.new("RGB", (TILE_SIZE * 3, TILE_SIZE * 3))
-    for dx in range(-1, 2):
-        for dy in range(-1, 2):
-            tile = get_tile(center_x + dx, center_y + dy)
-            base.paste(tile, ((dx + 1) * TILE_SIZE, (dy + 1) * TILE_SIZE))
-    return base
+        return Image.new("RGBA", (TILE_SIZE, TILE_SIZE), (0, 0, 0, 0))
 
 def get_weapon_icon(weapon_id):
-    # Dynamic fetch from SCUM wiki by weapon_id
-    try:
-        if weapon_id in STATIC_ICONS:
-            url = STATIC_ICONS[weapon_id]
-        else:
-            url = f"https://scum.fandom.com/wiki/Special:FilePath/{weapon_id.replace('BP_Weapon_', '')}.png"
-        r = requests.get(url)
-        r.raise_for_status()
-        return Image.open(BytesIO(r.content)).convert("RGBA")
-    except Exception as e:
-        print(f"Could not fetch icon for {weapon_id}: {e}")
-        return None
+    if weapon_id in WEAPON_ICON_OVERRIDES:
+        hash = WEAPON_ICON_OVERRIDES[weapon_id]
+        url = f"https://static.wikia.nocookie.net/scum_gamepedia/images/{hash}/revision/latest"
+        try:
+            response = requests.get(url)
+            response.raise_for_status()
+            return Image.open(BytesIO(response.content)).convert("RGBA")
+        except Exception as e:
+            print(f"Failed to load weapon icon for {weapon_id}: {e}")
+    return None
 
-def create_kill_image(killer, victim, weapon_id, location):
-    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-    font = ImageFont.truetype(font_path, 32)
+def generate_kill_image(killer, victim, weapon_id, location):
+    map_image = Image.new("RGBA", (TILE_SIZE * 3, TILE_SIZE * 3))
+    base_x, base_y = int(location[0] / TILE_SIZE), int(location[1] / TILE_SIZE)
 
-    tile_x, tile_y = coords_to_tile(*location)
-    map_img = stitch_map(tile_x, tile_y).convert("RGBA")
-    draw = ImageDraw.Draw(map_img)
+    for dx in range(-1, 2):
+        for dy in range(-1, 2):
+            tile_x = base_x + dx
+            tile_y = base_y + dy
+            tile = fetch_tile(tile_x, tile_y)
+            map_image.paste(tile, ((dx + 1) * TILE_SIZE, (dy + 1) * TILE_SIZE))
 
-    # Draw text
-    text = f"{killer} killed {victim}"
-    draw.rectangle((20, 20, 700, 80), fill=(0, 0, 0, 180))
-    draw.text((30, 30), text, font=font, fill=(255, 255, 255, 255))
+    draw = ImageDraw.Draw(map_image)
+    font = ImageFont.load_default()
 
-    # Weapon icon
+    draw.text((10, 10), f"{killer} killed {victim}", fill="red", font=font)
+
     icon = get_weapon_icon(weapon_id)
     if icon:
         icon = icon.resize((64, 64))
-        map_img.paste(icon, (740, 20), icon)
+        map_image.paste(icon, (10, 40), mask=icon)
 
     output_path = "kill_webhook_output.png"
-    map_img.save(output_path)
+    map_image.save(output_path)
     return output_path
+
+def send_to_discord(file_path, message):
+    with open(file_path, "rb") as f:
+        response = requests.post(
+            WEBHOOK_URL,
+            files={"file": (os.path.basename(file_path), f)},
+            data={"content": message}
+        )
+    if response.status_code >= 400:
+        print(f"Discord webhook failed: {response.status_code} {response.text}")
+
+@app.route("/", methods=["GET"])
+def index():
+    return "<h2>SCUM Killfeed Bot działa 🚀</h2>", 200
 
 @app.route("/kill", methods=["POST"])
 def kill():
     data = request.get_json()
-    killer = data.get("killer")
-    victim = data.get("victim")
-    weapon = data.get("weapon")
-    location = data.get("location")
+    killer = data.get("killer", "Unknown Killer")
+    victim = data.get("victim", "Unknown Victim")
+    weapon_id = data.get("weapon", "UnknownWeapon")
+    location = data.get("location", [55000, 51000])
 
-    if not all([killer, victim, weapon, location]):
-        return jsonify({"error": "Missing fields"}), 400
+    image_path = generate_kill_image(killer, victim, weapon_id, location)
+    message = f"💀 {killer} zabił {victim} za pomocą `{weapon_id}`"
+    send_to_discord(image_path, message)
 
-    img_path = create_kill_image(killer, victim, weapon, location)
-
-    webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
-    if webhook_url:
-        with open(img_path, "rb") as f:
-            files = {"file": f}
-            r = requests.post(webhook_url, files=files)
-            print("Discord response:", r.status_code)
-
-    return jsonify({"status": "ok"})
+    return {"status": "ok"}, 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
