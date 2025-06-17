@@ -1,59 +1,82 @@
-
 import os
-import json
+import math
 import requests
 from PIL import Image, ImageDraw, ImageFont
 
-LOG_PATH = "logs/scum_log.txt"
-WEBHOOK_URL = "https://discord.com/api/webhooks/1383407890663997450/hr2zvr2PjO20IDLIk5nZd8juZDxG9kYkOOZ0c2_sqzGtuXra8Dz-HbhtnhtF3Yb0Hsgi"
+def world_to_tile_coords(x, y, zoom=6):
+    map_size = 600000  # SCUM map dimension (in cm)
+    normalized_x = (x / map_size) % 1.0
+    normalized_y = (0.5 - (y / map_size)) % 1.0
+    n = 2 ** zoom
+    xtile = normalized_x * n
+    ytile = normalized_y * n
+    return xtile, ytile
 
-def parse_latest_kill(log_path):
-    with open(log_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    for line in reversed(lines):
-        if "Died:" in line:
-            parts = line.split("Died:")[1].split("Weapon:")
-            killer_data = parts[0].split("Killer:")
-            victim = killer_data[0].strip().split(" ")[0]
-            killer = killer_data[1].strip().split(" ")[0]
-            weapon = parts[1].split("[")[0].strip()
-            return killer, victim, weapon
-    return None, None, None
+def fetch_map_tiles(center_xtile, center_ytile, zoom, tile_size=256):
+    image = Image.new("RGB", (tile_size * 3, tile_size * 3))
+    for dx in range(-1, 2):
+        for dy in range(-1, 2):
+            tx = int(center_xtile) + dx
+            ty = int(center_ytile) + dy
+            url = f"https://scum-map.com/tiles/{zoom}/{tx}/{ty}.png"
+            try:
+                response = requests.get(url)
+                tile = Image.open(requests.compat.BytesIO(response.content))
+                image.paste(tile, ((dx + 1) * tile_size, (dy + 1) * tile_size))
+            except Exception as e:
+                print(f"Failed to fetch tile {tx},{ty}: {e}")
+    return image
 
-def create_kill_image(killer, victim, weapon):
-    bg = Image.open("assets/background.png").convert("RGBA")
-    draw = ImageDraw.Draw(bg)
-    font = ImageFont.truetype("assets/Orbitron.ttf", 42)
+def draw_marker_on_map(image, xtile, ytile, tile_size=256):
+    draw = ImageDraw.Draw(image)
+    offset_x = (xtile % 1.0) * tile_size + tile_size
+    offset_y = (ytile % 1.0) * tile_size + tile_size
+    draw.ellipse((offset_x - 10, offset_y - 10, offset_x + 10, offset_y + 10), fill="red", outline="white", width=2)
 
-    text = f"{killer} eliminated {victim}\nwith {weapon}"
-    draw.multiline_text((60, 380), text, font=font, fill=(255, 255, 255), spacing=10)
-    
-    output_path = "kill_report.png"
-    bg.save(output_path)
-    return output_path
+def add_text_overlay(image, killer, victim, weapon, distance):
+    draw = ImageDraw.Draw(image)
+    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    if not os.path.exists(font_path):
+        font_path = None
+    font = ImageFont.truetype(font_path, 20) if font_path else None
+    text = f"{killer} killed {victim} with {weapon}\nDistance: {distance:.2f} m"
+    draw.text((10, 10), text, fill="white", font=font)
 
-def send_to_discord(image_path):
-    with open(image_path, "rb") as img_file:
-        payload = {
-            "username": "Discovery Bot",
-            "content": "🗡️ Nowe zabójstwo zgłoszone!"
-        }
-        files = {"file": (os.path.basename(image_path), img_file)}
-        requests.post(WEBHOOK_URL, data=payload, files=files)
+def generate_kill_webhook_image(log_data, output_path="kill_webhook_output.png"):
+    victim_x = log_data['Victim']['ServerLocation']['X']
+    victim_y = log_data['Victim']['ServerLocation']['Y']
+    xtile, ytile = world_to_tile_coords(victim_x, victim_y)
+    zoom = 6
+    map_img = fetch_map_tiles(xtile, ytile, zoom)
+    draw_marker_on_map(map_img, xtile, ytile)
 
-def main():
-    if not os.path.exists(LOG_PATH):
-        print("❌ Plik loga nie istnieje.")
-        return
+    killer = log_data['Killer']['ProfileName']
+    victim = log_data['Victim']['ProfileName']
+    weapon = log_data['Weapon'].split()[0].replace("_", " ")
+    distance = math.dist([
+        log_data['Killer']['ServerLocation']['X'],
+        log_data['Killer']['ServerLocation']['Y']
+    ], [
+        log_data['Victim']['ServerLocation']['X'],
+        log_data['Victim']['ServerLocation']['Y']
+    ])
 
-    killer, victim, weapon = parse_latest_kill(LOG_PATH)
-    if not killer:
-        print("❌ Nie znaleziono zabójstwa w logu.")
-        return
+    add_text_overlay(map_img, killer, victim, weapon, distance)
+    map_img.save(output_path)
+    print(f"Saved image to {output_path}")
 
-    image_path = create_kill_image(killer, victim, weapon)
-    send_to_discord(image_path)
-    print("✅ Zgłoszono do Discorda.")
+# Example usage
+log = {
+    "Killer": {
+        "ServerLocation": {"X": 525405.75, "Y": -192209.703125, "Z": 1195.30},
+        "ProfileName": "Anu"
+    },
+    "Victim": {
+        "ServerLocation": {"X": 525345.625, "Y": -192173.53125, "Z": 1195.31},
+        "ProfileName": "Milo"
+    },
+    "Weapon": "2H_Katana_C_2147327617 [Melee]"
+}
 
 if __name__ == "__main__":
-    main()
+    generate_kill_webhook_image(log)
