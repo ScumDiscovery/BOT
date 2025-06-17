@@ -1,64 +1,97 @@
-import os
-from flask import Flask, request, send_file
+import io
+import requests
 from PIL import Image, ImageDraw, ImageFont
+from flask import Flask, request
 
+# Flask app
 app = Flask(__name__)
 
-# Ścieżki do zasobów
-MAP_PATH = "assets/map.png"
-PIN_PATH = "assets/pin.png"
-FONT_PATH = "assets/font.ttf"
+# Webhook Discorda
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1383407890663997450/hr2zvr2PjO20IDLIk5nZd8juZDxG9kYkOOZ0c2_sqzGtuXra8Dz-HbhtnhtF3Yb0Hsgi"
 
-# Rozmiar mapy SCUM i jej offsety (na bazie https://scum-map.com)
+# Stałe
 MAP_WIDTH = 4096
 MAP_HEIGHT = 4096
-WORLD_MIN_X = 0
-WORLD_MAX_X = 600_000
-WORLD_MIN_Y = -300_000
-WORLD_MAX_Y = 0
+GAME_WORLD_SIZE = 16  # 16x16 km mapa SCUM
 
-def world_to_image_coords(x, y):
-    norm_x = (x - WORLD_MIN_X) / (WORLD_MAX_X - WORLD_MIN_X)
-    norm_y = (y - WORLD_MIN_Y) / (WORLD_MAX_Y - WORLD_MIN_Y)
-    pixel_x = int(norm_x * MAP_WIDTH)
-    pixel_y = int(norm_y * MAP_HEIGHT)
-    return pixel_x, pixel_y
+def parse_log_entry(log_line):
+    """
+    Parsuje dane z loga SCUM:
+    - zabójca
+    - ofiara
+    - broń
+    - współrzędne X, Y
+    """
+    try:
+        parts = log_line.split("killed")
+        killer_info = parts[0].split("]")[-2].split("[")[0].strip()
+        victim_info = parts[1].split("with")[0].strip()
+        weapon = parts[1].split("with")[1].split("at")[0].strip()
+        coords_str = parts[1].split("at")[1].strip()
+        x = float(coords_str.split("X=")[1].split(",")[0])
+        y = float(coords_str.split("Y=")[1].split(",")[0])
+        return killer_info, victim_info, weapon, x, y
+    except Exception as e:
+        print(f"Błąd parsowania loga: {e}")
+        return None, None, None, None, None
 
-def draw_overlay(victim_name, killer_name, weapon_name, distance, pos_x, pos_y):
-    base = Image.open(MAP_PATH).convert("RGBA")
-    pin = Image.open(PIN_PATH).convert("RGBA").resize((48, 48))
+def world_to_map(x, y):
+    scale = MAP_WIDTH / (GAME_WORLD_SIZE * 1000.0)
+    return int(x * scale), int((GAME_WORLD_SIZE * 1000.0 - y) * scale)
 
-    pin_x, pin_y = world_to_image_coords(pos_x, pos_y)
-    base.paste(pin, (pin_x - 24, pin_y - 48), pin)
+def generate_image(x, y, killer, victim, weapon):
+    base_map = Image.open("assets/scum_map.png").convert("RGBA")
+    draw = ImageDraw.Draw(base_map)
+    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"  # może wymagać zmiany lokalnie
+    try:
+        font = ImageFont.truetype(font_path, 40)
+    except:
+        font = ImageFont.load_default()
 
-    draw = ImageDraw.Draw(base)
-    font = ImageFont.truetype(FONT_PATH, 32)
+    # Pozycja punktu
+    map_x, map_y = world_to_map(x, y)
+    radius = 12
+    draw.ellipse((map_x - radius, map_y - radius, map_x + radius, map_y + radius), fill=(255, 0, 0, 255), outline=(0, 0, 0))
 
-    text = f"{killer_name} ➤ {victim_name}\n🔪 {weapon_name} | 📏 {distance:.1f}m"
-    draw.text((pin_x + 20, pin_y - 40), text, font=font, fill=(255, 255, 255, 255))
+    # Tekst
+    text = f"{killer} zabił {victim} przy użyciu {weapon}"
+    draw.text((50, 50), text, fill="white", font=font)
 
-    output_path = "output/kill_overlay.png"
-    os.makedirs("output", exist_ok=True)
-    base.save(output_path)
+    # Zapis do bufora
+    output = io.BytesIO()
+    base_map.save(output, format="PNG")
+    output.seek(0)
+    return output
 
-    return output_path
+def send_to_discord(image_bytes, text):
+    files = {
+        "file": ("map.png", image_bytes, "image/png")
+    }
+    data = {
+        "content": text
+    }
+    response = requests.post(DISCORD_WEBHOOK_URL, data=data, files=files)
+    print("Status:", response.status_code)
+    return response.status_code == 204 or response.status_code == 200
 
-@app.route("/webhook-image", methods=["POST"])
-def webhook_image():
+@app.route("/log", methods=["POST"])
+def handle_log():
     data = request.json
+    log_line = data.get("log")
 
-    victim_name = data["Victim"]["ProfileName"]
-    killer_name = data["Killer"]["ProfileName"]
-    weapon_str = data["Weapon"]
-    distance = float(data.get("Distance", 0))
-    pos_x = float(data["Victim"]["ServerLocation"]["X"])
-    pos_y = float(data["Victim"]["ServerLocation"]["Y"])
+    if not log_line:
+        return {"error": "Brak loga"}, 400
 
-    # Wyodrębnij tylko nazwę broni
-    weapon_clean = weapon_str.split()[0].replace("_", " ")
+    killer, victim, weapon, x, y = parse_log_entry(log_line)
 
-    image_path = draw_overlay(victim_name, killer_name, weapon_clean, distance, pos_x, pos_y)
-    return send_file(image_path, mimetype='image/png')
+    if None in (killer, victim, weapon, x, y):
+        return {"error": "Nieprawidłowe dane loga"}, 400
+
+    image = generate_image(x, y, killer, victim, weapon)
+    content = f"☠️ {killer} zabił {victim} przy użyciu `{weapon}` na współrzędnych **X={int(x)}, Y={int(y)}**"
+
+    send_to_discord(image, content)
+    return {"status": "OK"}, 200
 
 if __name__ == "__main__":
     app.run(debug=True)
